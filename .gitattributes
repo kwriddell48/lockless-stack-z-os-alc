@@ -1,2 +1,9 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+# Treat all .asm files as Assembler
+*.asm linguist-language=Assembly
+
+# Treat .s or .mac files as Assembler too
+*.s   linguist-language=Assembly
+*.mac linguist-language=Assembly
+*.inc linguist-language=Assembly
