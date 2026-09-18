@@ -2,32 +2,28 @@
 ***********************************************************************
 *  MPMCQ_VERSION.ASM
 *
-*  GETVERSION
-*    Returns a version/build string for this product.
+*  GETVERSION — return an assemble-time stamped build/version string.
 *
 *  Timestamping:
-*    - Uses HLASM system variables &SYSDATE and &SYSTIME, so the string is
-*      stamped at ASSEMBLE TIME (not at runtime).
+*    &SYSDATE / &SYSTIME are expanded by HLASM when this module is
+*    assembled, not at runtime.
 *
-*  Calling:
-*    R1 -> parm list (MPMCQ_GETVER_PLIST):
-*      outAddr (F)          - 31-bit buffer address (or 0)
-*      outMaxLen (F)        - max bytes to copy into outAddr
-*      outActLenAddr (F)    - 31-bit address of fullword to receive actual length
+*  Calling (R1 -> MPMCQ_GETVER_PLIST):
+*    outAddr       - 31-bit buffer address, or 0
+*    outMaxLen     - max bytes to copy when outAddr != 0
+*    outActLenAddr - optional fullword to receive the FULL string length
 *
-*    Behavior:
-*      - If outAddr == 0:
-*          returns R1 = address of internal constant string
-*                  R0 = length
-*                  R15=0
-*      - If outAddr != 0:
-*          copies min(outMaxLen, length) bytes to outAddr,
-*          stores full length at *outActLenAddr (if provided),
-*          returns R15=0 if not truncated, R15=8 if truncated.
+*  Behavior:
+*    outAddr == 0:
+*      R1 = address of internal constant string
+*      R0 = length
+*      R15 = 0
+*    outAddr != 0:
+*      copies min(outMaxLen, VER_LEN) bytes
+*      stores VER_LEN at *outActLenAddr if provided
+*      R15 = 0 if not truncated, 8 if truncated
 *
-*  Reentrancy / RENT:
-*    - Version string is constant.
-*    - No writable static storage used.
+*  RENT: version string is a constant; no writable static used.
 ***********************************************************************
 
          PRINT GEN
@@ -35,6 +31,7 @@
 
          COPY  'src/reg_equates.inc'
          COPY  'src/mpmcq_dsects.inc'
+         COPY  'src/mpmcq_save.mac'
 
 MPMCQVER CSECT
 MPMCQVER AMODE 31
@@ -43,63 +40,58 @@ MPMCQVER RMODE ANY
          ENTRY GETVERSION
          USING MPMCQVER,R15
 
-***********************************************************************
-* Assemble-time stamped version string
-***********************************************************************
+* Assemble-time stamped product string (immutable).
 VER_STR  DC    C'MPMC stack build &SYSDATE &SYSTIME'
 VER_END  DS    0C
 VER_LEN  EQU   VER_END-VER_STR
+
+GV_WLEN  EQU   72                          save area only
 
 ***********************************************************************
 * GETVERSION(outAddr, outMaxLen, outActLenAddr)
 ***********************************************************************
 GETVERSION DS 0H
-         STM   R14,R12,12(R13)
-         LR    R12,R15
-         USING MPMCQVER,R12
+         MPMCQ_ENTER GV_WLEN
+         USING MPMCQVER,12
 
-         L     R3,GVER_OUTADDR(R1)
+         LT    R3,GVER_OUTADDR(R1)         load+test; 0 => return string ptr
          L     R4,GVER_OUTMAX(R1)
 
-* If caller requested the pointer, return it directly.
-         LT     R3,GVER_OUTADDR(R1)
+* Pointer-only request: return internal address/length in R1/R0.
          JNZ   GV_DO_COPY
          LA    R1,VER_STR
          LA    R0,VER_LEN
          XR    R15,R15
-         LM    R14,R12,12(R13)
-         BR    R14
+         MPMCQ_RETURN_R01 R15,GV_WLEN      preserves R0/R1/R15 across LM
 
 GV_DO_COPY DS 0H
-* Store actual/full length (if caller provided an address)
+* Always report the full logical length when the caller provided a slot.
          LT    R5,GVER_OUTACTLENADDR(R1)
          JZ    GV_LEN_DONE
          LA    R0,VER_LEN
          ST    R0,0(R5)
 GV_LEN_DONE DS 0H
 
-* Compute copy length: copyLen = min(outMaxLen, VER_LEN)
+* copyLen = min(outMaxLen, VER_LEN); RC=8 if truncated.
          LA    R0,VER_LEN
-         LR    R6,R0                    R6 = copyLen candidate
+         LR    R6,R0
          CR    R4,R6
          JNL   GV_FITS
-         LR    R6,R4                    copyLen = outMaxLen
-         LA    R15,8                    truncated RC
+         LR    R6,R4                       truncated copy length
+         LA    R7,8                        RC=truncated
          J     GV_HAVE_LEN
 GV_FITS  DS 0H
-         XR    R15,R15                  RC=0
+         XR    R7,R7                       RC=0
 GV_HAVE_LEN DS 0H
 
-* Copy using MVCL with equal lengths so no padding occurs.
-* Dest pair: R8/R9, Src pair: R10/R11
-         LR    R8,R3
-         LR    R9,R6
-         LA    R10,VER_STR
-         LR    R11,R6
+* MVCL with equal dest/src lengths avoids zero-padding.
+         LR    R8,R3                       dest addr
+         LR    R9,R6                       dest len
+         LA    R10,VER_STR                 src addr
+         LR    R11,R6                      src len
          MVCL  R8,R10
 
-         LM    R14,R12,12(R13)
-         BR    R14
+         LR    R15,R7                      restore RC after MVCL scratch
+         MPMCQ_RETURN R15,GV_WLEN
 
          END   MPMCQVER
-
