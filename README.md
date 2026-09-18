@@ -23,6 +23,19 @@ It is designed to meet these requirements:
 - `GETVERSION(outAddr, outMaxLen, outActLenAddr)` (returns assemble-time stamped build string)
 - `SCBSTOP(SCBaddr)` (optional): stop notifier TCB.
 
+## Caller includes (how to call)
+
+- **Assembler callers**:
+  - `COPY 'user_api.inc'`
+  - Allocate an SCB buffer of size `SCB_SIZE` (must be 31-bit addressable).
+  - Build the appropriate parameter list in 31-bit storage and call the entry point with `R1 -> parm list`.
+
+- **C callers**:
+  - Include `include/mpmcs_user.h` for prototypes and example call patterns.
+  - SCB storage must still be 31-bit addressable; allocate it using your site standard.
+  - The SCB is **caller-owned control-block storage** and must remain allocated/valid for the full lifetime of the stack instance (from `SINIT` until you stop using that SCB with `SPUSH/SPOP/SSTATS/SCBSTOP`).
+  - Multiple independent stacks can be used concurrently by allocating/initializing **multiple SCBs** (one SCB per stack instance).
+
 Return codes:
 
 - `SPUSH`: `RC=0` success, `RC=8` allocation failure.
@@ -30,6 +43,7 @@ Return codes:
 
 ## Source layout
 
+- `src/mpmcq_save.mac`: standard save-area enter/return helpers (RENT).
 - `src/mpmcq_dsects.inc`: DSECTs for SCB, node, stats, parm lists.
 - `src/mpmcq_atomics.mac`: `CS`/`CDS` retry-loop macros.
 - `src/mpmcq_copy64.mac`: `SAM64`/`SAM31` wrapped copy helpers (31<->64).
@@ -43,6 +57,7 @@ Return codes:
 
 - This code assumes a z/Architecture environment where `CDS` (doubleword compare-and-swap) is available.
 - Statistics are **approximate** under concurrency to keep the stack lock-free and fast.
+- **Performance pools** (filled at `SINIT`): a node freelist and a fixed-size work-cell freelist so warm-path `SPUSH`/`SPOP` avoid `GETMAIN`/`FREEMAIN`. Override node prefill via `SINIT` OPTIONS **high half** (bits 0–15; 0 = default 64). Payload mode is OPTIONS bit 31 (`MPMCS_OPT_PAYLOAD64`).
 - `src/mpmcq_storage.asm` contains `IARV64` macro usage; you may need to adjust the macro operands to match your z/OS level/policy (key, guard pages, etc.).
 
 ## Using the async notification
@@ -63,9 +78,9 @@ Call `SSTATS(SCBaddr, outStatsAddr, outStatsLen)` to copy a snapshot (see `src/m
 
 Included counters:
 
-- `ENQ_OK`, `DEQ_OK`, `DEQ_EMPTY`, `ENQ_ALLOC_FAIL`
-- `PUSH_RETRY`, `POP_RETRY`
-- `QDEPTH_CUR`, `QDEPTH_MAX` (best-effort)
+- `PUSH_OK`, `POP_OK`, `POP_EMPTY`, `PUSH_ALLOC_FAIL`
+- `PUSH_RETRY`, `POP_RETRY`, freelist retry counters
+- `DEPTH_CUR`, `DEPTH_MAX` (best-effort)
 - `PAYLOAD31_CUR`, `PAYLOAD31_MAX` (bytes in 31-bit storage)
 - `PAYLOAD64_CUR`, `PAYLOAD64_MAX` (bytes in 64-bit storage)
 - `POST_INTERNAL`, `POST_USERECB`, `CB_CALLS`, `CB_PENDING_MAX`

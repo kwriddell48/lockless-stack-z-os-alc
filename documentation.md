@@ -75,6 +75,11 @@ All layouts are in `src/mpmcq_dsects.inc`.
 
 Key fields:
 
+- **Instance identity / multiple stacks**
+  - Each independent stack instance is identified by the address of its **own SCB**.
+  - You can run **multiple stacks at the same time** by allocating and initializing multiple SCBs (one `SINIT` per SCB) and then passing the desired SCB address to each `SPUSH/SPOP/SSTATS/SCBSTOP` call.
+  - Do not share one SCB between unrelated stacks; one SCB = one stack instance.
+
 - **Identification**
   - `SCB_EYECATCH` (`CL8`): `'MPMCSTK '`
   - `SCB_NAME` (`CL16`): user-assigned name (for logs/messages)
@@ -175,6 +180,109 @@ Returns an assemble-time stamped string (see `src/mpmcq_version.asm`).
 
 - If `outAddr==0`: returns `R1=ptr`, `R0=len`, `R15=0`.
 - Else copies and returns `R15=0` or `R15=8` if truncated.
+
+---
+
+### Caller guide (using `user_api.inc`)
+
+`user_api.inc` is the **single-file user include** intended for assembler callers. It contains the entry point names, option/return-code equates, and the DSECTs you need to build parameter lists.
+
+#### Storage requirements
+
+- **SCB storage**:
+  - Allocate at least `SCB_SIZE` bytes.
+  - Must be **31-bit addressable** (below the bar).
+  - The SCB is **caller-owned control-block storage** and must remain allocated/valid for the full lifetime of the stack instance (from `SINIT` until you stop using that SCB with `SPUSH/SPOP/SSTATS/SCBSTOP`).
+  - Alignment is not strict, but using `DS 0D` before the SCB is a good practice.
+
+- **Parameter lists**:
+  - Each call needs a parameter list in 31-bit addressable storage.
+  - Build the list using the DSECT offsets from `user_api.inc` (e.g., `SINIT_SCBADDR`, `SPU_SRCADDR`, etc.).
+
+- **Buffers**:
+  - `srcAddr`, `dstAddr`, and `outLenAddr` are **31-bit addresses**.
+  - Payload mode can still be 64-bit internally; callers still pass 31-bit buffer addresses.
+
+#### Basic assembler pattern
+
+1. `COPY 'user_api.inc'`
+2. `EXTRN` the entry point(s) you will call.
+3. Allocate SCB storage and one parm list per call.
+4. Set fields in the parm list, then call with `R1 -> parm list`.
+
+Example outline:
+
+- `SINIT`:
+  - Build `MPMCS_SINIT_PLIST` with:
+    - `SINIT_SCBADDR` = address of your SCB storage
+    - `SINIT_OPTIONS` = `MPMCS_OPT_PAYLOAD31` or `MPMCS_OPT_PAYLOAD64`
+    - `SINIT_CB_EP` = 0 (no notifier) or callback EP
+    - `SINIT_CB_CTX` = user context value passed to callback
+    - `SINIT_USER_ECB` = 0 or address of an ECB fullword to POST on each push
+
+- `SPUSH`:
+  - Build `MPMCS_SPUSH_PLIST` with:
+    - `SPU_SCBADDR` = SCB
+    - `SPU_SRCADDR` = source buffer address
+    - `SPU_SRCLEN` = byte length
+
+- `SPOP`:
+  - Build `MPMCS_SPOP_PLIST` with:
+    - `SPO_SCBADDR` = SCB
+    - `SPO_DSTADDR` = destination buffer address
+    - `SPO_DSTMAX` = max bytes to copy
+    - `SPO_OUTLENADDR` = address of a fullword receiving the actual message length (optional; can be 0)
+
+- `SSTATS`:
+  - Build `MPMCS_SSTATS_PLIST` with:
+    - `SST_SCBADDR` = SCB
+    - `SST_OUTADDR` = destination buffer for `MPMCS_STATS`
+    - `SST_OUTLEN` = size of your buffer
+
+#### Example: GETMAIN an SCB, then call `SINIT`
+
+This example obtains SCB storage **below the bar** using `GETMAIN`, then calls `SINIT` with `SINIT_SCBADDR` pointing at that obtained storage.
+
+```asm
+         COPY  'user_api.inc'
+         EXTRN SINIT
+
+* Work areas (below the bar):
+SINITPL   DS    0F
+          DS    (SINIT_USER_ECB+4)X
+
+* Obtain SCB storage below the bar.
+          LA    R4,SCB_SIZE
+          GETMAIN RU,LV=(R4),LOC=BELOW
+          LR    R2,R1                 R2 = SCB address (31-bit)
+
+* Build the SINIT parameter list (R1 -> parm list).
+          LA    R1,SINITPL
+          ST    R2,SINIT_SCBADDR(R1)
+          MVC   SINIT_OPTIONS(R1),=F'MPMCS_OPT_PAYLOAD64'
+          MVC   SINIT_CB_EP(R1),=F'0'          no notifier callback
+          MVC   SINIT_CB_CTX(R1),=F'0'
+          MVC   SINIT_USER_ECB(R1),=F'0'
+
+* Call SINIT
+          L     R15,=V(SINIT)
+          BALR  R14,R15
+* R15=0 success
+
+* Later, when you are completely done with this SCB instance:
+*          LA    R4,SCB_SIZE
+*          LR    R1,R2
+*          FREEMAIN RU,A=(R1),LV=(R4)
+```
+
+#### C callers
+
+For C callers, use:
+
+- `include/mpmcs_user.h` for prototypes and example patterns
+- `user_api.inc` for the authoritative **SCB_SIZE** and field layouts (typically consumed by an assembler shim or build-time constants in your environment)
+
+The key rule is still: **SCB storage must be 31-bit addressable**.
 
 ---
 

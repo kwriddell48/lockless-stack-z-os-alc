@@ -16,6 +16,9 @@
 *  Notes:
 *    - Caller runs AMODE 31 and passes a standard parameter list at R1.
 *    - SCB storage must be below-the-bar (31-bit addressable).
+*    - The SCB is caller-owned control-block storage and must remain
+*      allocated/valid for the full lifetime of the stack instance
+*      (from SINIT until you stop using that SCB with SPUSH/SPOP/SSTATS/SCBSTOP).
 ***********************************************************************
 ***********************************************************************
 * Public entry points (external names)
@@ -28,9 +31,16 @@ SCBSTOP                 EQU   SCBSTOP
 GETVERSION              EQU   GETVERSION
 ***********************************************************************
 * Options (SINIT OPTIONS)
+*   bit 0      = payload mode (31 vs 64)
+*   bits 0-15 = node prefill count (0 = default MPMCS_NODE_PREFILL)
+*   bit 31    = MPMCS_OPT_PAYLOAD64 (X'00000001')
+*   Example:  (64)*65536+MPMCS_OPT_PAYLOAD64
 ***********************************************************************
 MPMCS_OPT_PAYLOAD31      EQU   X'00000000'  * default: payload below 2G
 MPMCS_OPT_PAYLOAD64      EQU   X'00000001'  * payload in 64-bit storage (IARV64)
+MPMCS_NODE_PREFILL       EQU   64           * default nodes onto freelist at SINIT
+MPMCS_WORK_PREFILL       EQU   16           * default work cells at SINIT
+MPMCS_WORK_CELL          EQU   512          * fixed work-cell size (ENTER_SCB)
 ***********************************************************************
 * Return codes
 ***********************************************************************
@@ -58,6 +68,9 @@ SCB_TOP_PTR            DS    F                 ptr to top node (31-bit)
 * Node freelist head (tagged pointer)
 SCB_FREE_ABA           DS    F                 ABA tag
 SCB_FREE_PTR           DS    F                 ptr to free node
+* Work-cell freelist (SPUSH/SPOP save areas — performance pool)
+SCB_WORK_ABA           DS    F
+SCB_WORK_PTR           DS    F
 * Async callback fields
 SCB_CB_EP              DS    F                 callback entry point (AMODE 31)
 SCB_CB_CTX             DS    F                 user context pointer (31-bit)

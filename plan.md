@@ -24,109 +24,49 @@ todos:
 
 # Lock-free MPMC LIFO stack + async notify + stats (HLASM, callable AMODE 31)
 
-## Goal
+## Current design summary (matches the implemented code)
 
-Deliver a **lock-free MPMC FIFO** in **z/OS HLASM** that:
+This project provides a **lock-free MPMC LIFO stack** callable from **AMODE 31** callers.
 
-- Is **callable from AMODE 31**
-- **Copies variable-length data into the stack**; message bytes are stored in **64-bit virtual storage**
-- `SPOP` **copies out** into caller buffer and frees payload storage
-- Provides async notification:
-- **ATTACHed notifier TCB** calls a user callback asynchronously
-- Optional **user-provided ECB** is POSTed on every successful push
-- Exposes **low-overhead (approximate) runtime statistics** via a `SSTATS` snapshot routine
+- **Caller-owned control block**: each stack instance is defined by its own **SCB** (Stack Control Block) in 31-bit addressable storage.
+- **Variable-length payloads**: `SPUSH` copies bytes into internal storage; `SPOP` copies bytes out, supports truncation, and always reports the actual length.
+- **Async notification**: optional user ECB POST on each successful push, and optional notifier TCB that calls a user callback EP.
+- **Statistics**: low-overhead approximate counters retrievable via `SSTATS`.
 
-## Core stack algorithm
+## Core algorithm
 
-- Michael-Scott MPMC FIFO with counted pointers updated via **`CDS`** (doubleword CAS) and refcount-based reclamation so nodes can be safely reused without thread registration.
-- **QCB + nodes in 31-bit storage**, payload bytes in **64-bit storage** via `IARV64`.
+- Public data structure: **Treiber MPMC stack** with a tagged **TOP** pointer `(ABA,PTR)` updated via `CDS`.
+- Node reuse: internal Treiber freelist (nodes recycled; not returned to the system).
+- ABA mitigation: fresh tags generated from `SCB_ABA_SEQ` (CS loop) for pointer swings.
 
-## Variable-length payload semantics
+## Public entry points and return codes
 
-- `SPUSH(SCB, srcAddr, srcLen)`: allocates payload (`IARV64` in 64-bit mode), copies in, and pushes node containing `(payload64Addr, payloadLen)`.
-- `SPOP(SCB, dstAddr, dstMaxLen, outLenAddr)`:
-- RC=4 empty
-- RC=0 copied full message
-- RC=8 truncated (copied `dstMaxLen`, but `*outLen=actualLen`)
-- frees 64-bit payload + recycles node.
+- `SINIT(SCBaddr, options, CB_EP, CB_CTX, USER_ECB)` → `RC=0`
+- `SPUSH(SCBaddr, srcAddr, srcLen)` → `RC=0` success, `RC=8` allocation failure
+- `SPOP(SCBaddr, dstAddr, dstMaxLen, outLenAddr)` → `RC=4` empty, `RC=0` success, `RC=8` truncated
+- `SSTATS(SCBaddr, outStatsAddr, outStatsLen)` → `RC=0`
+- `SCBSTOP(SCBaddr)` → `RC=0`
+- `GETVERSION(outAddr, outMaxLen, outActLenAddr)` → `RC=0` or `RC=8` truncated
 
-## Notifications
+## Caller constraints (important)
 
-### Async callback on separate TCB
+- **SCB lifetime**: the SCB is caller-owned control-block storage and must remain allocated/valid for the full lifetime of the stack instance (from `SINIT` until you stop using that SCB with `SPUSH/SPOP/SSTATS/SCBSTOP`).
+- **Multiple stacks**: you can run multiple independent stacks concurrently by allocating/initializing multiple SCBs (one SCB per stack instance).
+- **Addressability**: SCB and all caller buffers/pointers passed in parm lists must be 31-bit addressable.
 
-- One notifier TCB is created once (via `ATTACH`). Producers never run user code.
-- Callback parm list order (R1->list): **`(CB_CTX, QCBaddr, PendingCount)`**.
-- `SPUSH` increments `PUSH_SEQ` and `POST`s internal ECB to wake notifier.
+## Notification semantics
 
-### User ECB notify
+- **User ECB**: if `USER_ECB` is non-zero and addressable, each successful `SPUSH` does `POST ECB=(USER_ECB)`.
+- **Notifier TCB**: if `CB_EP` is non-zero in `SINIT`, a notifier task is ATTACHed. Producers POST an internal ECB; the notifier WAITs and calls the callback EP with parm list `(CB_CTX, SCBaddr, PendingCount)` where `PendingCount` is computed from a sequence delta.
 
-- Optional `USER_ECB` in SCB; `SPUSH` does `POST USER_ECB` on every successful push.
+## Stats semantics
 
-## Statistics (approximate, low overhead)
+- Stats are approximate under concurrency; updates use CS/CDS retry loops.
+- `SSTATS` copies a versioned snapshot to a caller buffer (copy length is `min(outStatsLen, statsSize)`).
 
-### Principles
+## User include / headers
 
-- Stats are **approximate** under concurrency (monotonic counters; current-size is best-effort).
-- Updates use **`CS` loops** (fullword) or **`CDS`** for paired updates only where needed.
-- `SSTATS` provides a consistent-enough snapshot by copying fields (no global lock).
-
-### Stats to maintain (QCB fields)
-
-Counters are suggested as **fullword** unless noted.
-
-- **Push/pop activity**
-- `STAT_PUSH_OK`
-- `STAT_POP_OK`
-- `STAT_POP_EMPTY` (how often consumers found empty)
-- `STAT_PUSH_ALLOC_FAIL` (IARV64 obtain failed)
-- **Retry/contended-path visibility**
-- `STAT_PUSH_RETRY` (CAS loops / retry visibility)
-- `STAT_POP_RETRY`
-- `STAT_FREELIST_POP_RETRY` / `STAT_FREELIST_PUSH_RETRY`
-- **Depth (best-effort)**
-- `STAT_DEPTH_CUR` (signed fullword; increment after successful push, decrement after successful pop)
-- `STAT_QDEPTH_MAX` (max observed; update via CS loop when `CUR` exceeds)
-- **64-bit storage usage** (doubleword counters)
-- `STAT_PAYLOAD64_CUR` (bytes currently allocated for pushed payloads)
-- `STAT_PAYLOAD64_MAX` (max observed)
-- Optional: `STAT_PAYLOAD64_ALLOC` (total bytes ever obtained) / `STAT_PAYLOAD64_FREE`
-- **Notification activity**
-- `STAT_POST_INTERNAL` (internal ECB posts)
-- `STAT_POST_USERECB`
-- `STAT_CB_CALLS`
-- `STAT_CB_PENDING_MAX` (largest `PendingCount` ever delivered)
-
-### Stats retrieval API
-
-- `SSTATS(SCBaddr, outStatsAddr, outStatsLen)`
-- Copies a packed stats DSECT to caller.
-- `outStatsLen` allows versioning/forward compatibility.
-
-## Entry points
-
-- `SINIT(SCBaddr, options, CB_EP, CB_CTX, USER_ECB)`
-- `SPUSH(SCBaddr, srcAddr, srcLen)`
-- `SPOP(SCBaddr, dstAddr, dstMaxLen, outLenAddr)`
-- `SSTATS(SCBaddr, outStatsAddr, outStatsLen)`
-- `SCBSTOP(SCBaddr)` optional
-
-## Files to add
-
-- [README.md](README.md)
-- [src/mpmcq_dsects.inc](src/mpmcq_dsects.inc) (QCB/node + stats DSECT)
-- [src/mpmcq_atomics.mac](src/mpmcq_atomics.mac)
-- [src/mpmcq_copy64.mac](src/mpmcq_copy64.mac)
-- [src/mpmcq_storage.asm](src/mpmcq_storage.asm)
-- [src/mpmcq_notify.asm](src/mpmcq_notify.asm)
-- [src/mpmcq_stats.asm](src/mpmcq_stats.asm) (`SSTATS`, helper macros for counter increments/max)
-- [src/mpmcq.asm](src/mpmcq.asm)
-- [jcl/asm_lked.jcl](jcl/asm_lked.jcl)
-
-## Acceptance criteria
-
-- FIFO correctness under MPMC.
-- Varlen copy-in/out correctness, including truncation return codes.
-- Async callback executes on notifier TCB and receives correct `(CB_CTX, QCB, PendingCount)`.
-- User ECB POSTed on every push.
-- Stats counters move as expected; `SSTATS` returns a coherent snapshot suitable for monitoring.
+- `user_api.inc`: single-file user include with entry points, equates, SCB/parm-list layouts, and call examples.
+- `include/mpmcs_user.h`: C header with prototypes and example call patterns.
+- `include/mpmcs_user.inc`: assembler include exposing entry points and layouts (caller-facing).
 
