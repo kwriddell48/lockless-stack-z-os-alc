@@ -2,22 +2,33 @@
 ***********************************************************************
 *  MPMCQ_NOTIFY.ASM
 *
-*  Provides asynchronous push notifications:
-*   - One notifier TCB per stack, created with ATTACH (optional).
-*   - Producers never execute user code; they only POST ECB(s).
-*   - Notifier WAITs on internal ECB in SCB, computes PendingCount, calls
-*     user callback EP with parm list: (CB_CTX, SCBaddr, PendingCount).
+*  Asynchronous push notifications via ATTACH'd notifier TCB.
+*  See file header history in repo docs for coalescing / ECB protocol.
 *
-*  Notification semantics:
-*   - Each successful SPUSH increments SCB_PUSH_SEQ and POSTs SCB_CB_ECB.
-*   - ECB posts can coalesce; the notifier computes PendingCount as:
-*       PendingCount = PUSH_SEQ - CB_SEQ_SEEN
-*     so a single callback can represent multiple pushes.
+*  Performance:
+*    MPMCS_NSTART is a leaf (no GETMAIN) — called from SINIT with a
+*    work cell already chained.
+*    SCBSTOP uses ENTER_SCB / RETURN_SCB (work-cell pool).
+*    Notifier keeps a long-lived plist buffer (one GETMAIN for TCB life).
 *
-*  Entry points:
-*    MPMCS_NSTART (internal) - start notifier if CB_EP != 0
-*    SCBSTOP      (public)   - request notifier stop (best-effort)
-*    MPMCS_NOTIF  (internal) - ATTACH entry point (notifier TCB)
+*  ATTACH parameter passing:
+*    ATTACH PARM=(value) builds a parameter area containing that value
+*    and gives the new task R1 -> that area (an indirect pointer), not
+*    the value itself in R1. MPMCS_NSTART passes PARM=(Q_R) (the SCB
+*    address, in the current Q_R) and MPMCS_NOTIF dereferences it with
+*    L Q_R,0(R1) — do not "simplify" this to LR Q_R,R1, and do not pass
+*    a literal constant; either would leave Q_R pointing at the wrong
+*    storage entirely.
+*
+*  Shutdown synchronization:
+*    SCBSTOP sets the stop flag and POSTs SCB_CB_ECB to wake a WAITing
+*    notifier, then WAITs on SCB_STOP_ECB before returning. MPMCS_NOTIF
+*    POSTs SCB_STOP_ECB at the very end of NOTIF_DONE, once it has
+*    finished all cleanup and will no longer touch the SCB. This closes
+*    the window where a caller could free/reuse the SCB immediately
+*    after SCBSTOP returns while the subtask was still mid-cleanup.
+*    If no notifier was ever attached (SCB_CB_TCB still zero), SCBSTOP
+*    skips the WAIT entirely — nothing would ever post SCB_STOP_ECB.
 ***********************************************************************
 
          PRINT GEN
@@ -26,6 +37,7 @@
          COPY  'src/reg_equates.inc'
          COPY  'src/mpmcq_dsects.inc'
          COPY  'src/mpmcq_atomics.mac'
+         COPY  'src/mpmcq_save.mac'
 
 MPMCQNT  CSECT
 MPMCQNT  AMODE 31
@@ -37,52 +49,58 @@ MPMCQNT  RMODE ANY
 
          USING MPMCQNT,R15
 
-***********************************************************************
-* Flags (SCB_FLAGS bit definitions)
-***********************************************************************
 QCBF_STOP    EQU X'80000000'
 
+         EXTRN MPMCS_WORKGET
+         EXTRN MPMCS_WORKPUT
+
 ***********************************************************************
-* MPMCS_NSTART
-*   Input: Q_R = SCBaddr (already initialized by SINIT)
-*   Behavior: if SCB_CB_EP != 0, ATTACH a notifier TCB and store SCB_CB_TCB.
+* MPMCS_NSTART — leaf; In: Q_R=SCB (SINIT already has a next SA in R13)
+*
+* On ATTACH failure (R15 non-zero from ATTACH), SCB_CB_TCB is left
+* zero rather than storing whatever ATTACH happened to leave in R1.
+* SCBSTOP already treats a zero SCB_CB_TCB as "no notifier running"
+* and skips its shutdown WAIT accordingly, so a failed attach here
+* degrades to "no async notifications" rather than a bad pointer.
 ***********************************************************************
 MPMCS_NSTART DS 0H
          STM   R14,R12,12(R13)
          LR    R12,R15
          USING MPMCQNT,12
-
          USING MPMCS_SCB,Q_R
-* If no callback entry point is configured, do nothing.
+
          LT    R3,SCB_CB_EP
          JZ    NSTART_DONE
 
-* Ensure internal ECB starts cleared (WAIT expects an ECB address in the SCB)
          XR    R0,R0
          ST    R0,SCB_CB_ECB
+         ST    R0,SCB_STOP_ECB
+         ST    R0,SCB_CB_TCB
 
-* ATTACH notifier task. PARM is SCB address.
-* NOTE: Adjust ATTACH operands per your standards (subtask attributes, key, etc.).
-         ATTACH EP=MPMCS_NOTIF,PARM=(2)
+* Pass the SCB address itself (Q_R), not a literal. The subtask
+* dereferences it with L Q_R,0(R1) — see file header.
+         ATTACH EP=MPMCS_NOTIF,PARM=(Q_R)
+         LTR   R15,R15
+         JNZ   NSTART_DONE                  failed: SCB_CB_TCB stays 0
+         ST    R1,SCB_CB_TCB
 
 NSTART_DONE DS 0H
          XR    R15,R15
-         LM    R14,R12,12(R13)
-         BR    R14
+         MPMCQ_LEAF_RETURN R15
 
 ***********************************************************************
 * SCBSTOP(SCBaddr)
-*   R1 -> parm list: (SCBaddr)
 ***********************************************************************
 SCBSTOP  DS 0H
-         STM   R14,R12,12(R13)
-         LR    R12,R15
+         MPMCQ_ENTER_SCB
          USING MPMCQNT,12
-
-         L     Q_R,0(R1)
          USING MPMCS_SCB,Q_R
 
-* Set stop flag (best-effort)
+* Nothing to stop (and nothing will ever POST SCB_STOP_ECB) if no
+* notifier TCB was ever successfully attached.
+         LT    R4,SCB_CB_TCB
+         JZ    STOP_NONE
+
 STOP_LOOP DS 0H
          L     R0,SCB_FLAGS
          LR    R3,R0
@@ -90,83 +108,106 @@ STOP_LOOP DS 0H
          CS    R0,R3,SCB_FLAGS
          JNE   STOP_LOOP
 
-* Wake notifier so it can observe stop and exit.
-* (If the notifier isn't running, this POST is harmless.)
-         POST  ECB=SCB_CB_ECB
+         POST  ECB=SCB_CB_ECB               wake the notifier if it's WAITing
 
+* Block until MPMCS_NOTIF's NOTIF_DONE has fully finished cleanup, so
+* the caller cannot free/reuse the SCB while the subtask still holds
+* Q_R pointed at it.
+         WAIT  ECB=SCB_STOP_ECB
+
+STOP_NONE DS 0H
          XR    R15,R15
-         LM    R14,R12,12(R13)
-         BR    R14
+         MPMCQ_RETURN_SCB R15
 
 ***********************************************************************
-* MPMCS_NOTIF - notifier TCB body (ATTACH EP)
-*   R1 may contain parm (SCBaddr) depending on ATTACH form.
+* MPMCS_NOTIF — ATTACH'd notifier TCB body
+*   Entry: R1 -> fullword containing the SCB address (see ATTACH
+*   parameter-passing note in file header). NOT the SCB address itself.
 ***********************************************************************
 MPMCS_NOTIF DS 0H
          STM   R14,R12,12(R13)
          LR    R12,R15
          USING MPMCQNT,12
 
-* ATTACH parm: SCB address (convention; adjust if needed)
-         LR    Q_R,R1
+         L     Q_R,0(R1)                    R1 -> word holding SCB addr
          USING MPMCS_SCB,Q_R
 
-* Obtain a small private work area for callback parm list (reentrant).
-* The callback parm list must not be in static storage because multiple
-* notifiers (or reentry) could otherwise collide.
+* One plist buffer for the life of this TCB (not per-callback GETMAIN).
          LA    R4,32
          GETMAIN RU,LV=(R4),LOC=BELOW
-         LR    R11,R1                      R11=work area
+         LR    R11,R1
 
 NOTIF_LOOP DS 0H
-* WAIT until a producer posts the internal ECB.
          WAIT  ECB=SCB_CB_ECB
+         XR    R0,R0
+         ST    R0,SCB_CB_ECB               clear or next WAIT busy-spins
 
-* Stop requested? (best-effort cooperative stop)
-         L     R0,SCB_FLAGS
-         N     R0,=XL4'80000000'
-         LTR   R0,R0
-         JNZ   NOTIF_DONE
+         TM    SCB_FLAGS,X'80'             QCBF_STOP (high bit of FLAGS)
+         JO    NOTIF_DONE
 
-* Compute PendingCount = PUSH_SEQ - CB_SEQ_SEEN.
-* We accept wraparound as a best-effort approximation.
          L     R4,SCB_PUSH_SEQ
          L     R5,SCB_CB_SEQ_SEEN
-         SR    R4,R5                        pending (wrap ignored)
+         SR    R4,R5
          LTR   R4,R4
          JZ    NOTIF_LOOP
 
-* Advance CB_SEQ_SEEN to current PUSH_SEQ (best-effort).
-* This defines the "already notified" boundary.
          L     R6,SCB_PUSH_SEQ
          ST    R6,SCB_CB_SEQ_SEEN
 
-* Stats: cb calls, pending max
-         MPMCQ_STATINC Q_R,SCB_STAT_CB_CALLS,R8,R9
+         MPMCQ_STATINC Q_R,SCB_STAT_CB_CALLS
          MPMCQ_STATMAX Q_R,SCB_STAT_CB_PENDING_MAX,R4,R8,R9
 
-* Invoke callback EP if provided.
-* Callback runs on this notifier TCB (asynchronous relative to producers).
          LT    R7,SCB_CB_EP
          JZ    NOTIF_LOOP
+         LRA   R0,0(R7)
+         JNZ   NOTIF_LOOP
 
-* Build parm list in private work area (R1 -> plist):
-*   (CB_CTX, SCBaddr, PendingCount)
          LR    R1,R11
          L     R0,SCB_CB_CTX
          ST    R0,CBP_CTX(R1)
          ST    Q_R,CBP_SCB(R1)
          ST    R4,CBP_PENDING(R1)
 
+* Callback needs a next SA; try work pool first, else GETMAIN 72.
+         LR    R3,R1                       save plist
+         L     R15,=V(MPMCS_WORKGET)
+         BALR  R14,R15
+         LTR   R15,R15
+         JZ    NOTIF_HAVE_SA
+         LA    R0,72
+         GETMAIN RU,LV=(R0),LOC=BELOW
+         XR    R5,R5                       R5=0 => FREEMAIN after call
+         J     NOTIF_CHAIN_SA
+NOTIF_HAVE_SA DS 0H
+         LA    R5,1                        R5=1 => WORKPUT after call
+NOTIF_CHAIN_SA DS 0H
+         ST    R13,4(R1)
+         ST    R1,8(R13)
+         LR    R13,R1
+         LR    R1,R3                       plist for callback
          BALR  R14,R7
+         LR    R1,R13
+         L     R13,4(R13)
+         LTR   R5,R5
+         JZ    NOTIF_FREE_SA
+         L     R15,=V(MPMCS_WORKPUT)
+         BALR  R14,R15
+         J     NOTIF_LOOP
+NOTIF_FREE_SA DS 0H
+         LA    R0,72
+         FREEMAIN RU,A=(R1),LV=(R0)
          J     NOTIF_LOOP
 
 NOTIF_DONE DS 0H
          LA    R4,32
          LR    R1,R11
          FREEMAIN RU,A=(R1),LV=(R4)
+         XR    R0,R0
+         ST    R0,SCB_CB_TCB
+* Signal SCBSTOP that cleanup is complete and it is now safe for the
+* caller to free/reuse the SCB. Must be the last touch of Q_R/the SCB.
+         POST  ECB=SCB_STOP_ECB
          LM    R14,R12,12(R13)
          BR    R14
 
          END   MPMCQNT
-

@@ -1,22 +1,27 @@
-         TITLE 'MPMC stack - Lock-free freelist for node reuse (tagged pointer CDS)'
+         TITLE 'MPMC stack - Lock-free freelist (nodes + work cells)'
 ***********************************************************************
 *  MPMCQ_FREELIST.ASM
 *
-*  Implements a lock-free stack (Treiber) used as a node pool.
-*  This is an internal component: nodes are never returned to the system
-*  here; they are re-used by pushing/popping from SCB_FREE_(ABA,PTR).
+*  Two Treiber LIFO pools hang off the SCB:
+*    SCB_FREE_*  — MPMCQ_NODE cells (SPUSH/SPOP)
+*    SCB_WORK_*  — fixed MPMCS_WORK_CELL save/spill blocks (ENTER_SCB)
 *
-*  ABA mitigation:
-*    - The freelist head is a tagged pointer (ABA32, PTR31).
-*    - Pop/push update the pair atomically with CDS.
+*  MPMCS_POPNODE / MPMCS_PUSHNODE:
+*    Leaf with STM into caller's next SA (standard).
 *
-*  Reentrancy:
-*    - No static work areas; this module is safe RENT/reentrant.
-*    - All shared state is in the caller's SCB (SCB_FREE_ABA/SCB_FREE_PTR).
+*  MPMCS_WORKGET / MPMCS_WORKPUT:
+*    Naked helpers (no STM) for use from ENTER_SCB/RETURN_SCB macros.
+*    When a work cell is free, words 0/4 hold (NEXT_ABA, NEXT_PTR).
+*    While in use those words are the OS save-area header.
 *
-*  Exported internal entry points:
-*    MPMCS_POPNODE(SCBaddr)  -> R15=0 and R1=node or R15=4 empty
-*    MPMCS_PUSHNODE(SCBaddr,node) -> R15=0
+*  ABA tags are minted per-field as (old ABA + 1) at CDS time — each of
+*  SCB_FREE_ABA and SCB_WORK_ABA is tagged independently of the other
+*  and independently of SCB_TOP_ABA in MPMCQ.ASM. There is no shared
+*  tag generator: correctness only requires monotonicity within a
+*  single field's own CDS history, so a global counter was unnecessary
+*  contention (every pool was serializing through one cache line for
+*  no correctness benefit). SCB_ABA_SEQ is retained in the DSECT for
+*  layout/compat but is no longer read or written here.
 ***********************************************************************
 
          PRINT GEN
@@ -25,6 +30,7 @@
          COPY  'src/reg_equates.inc'
          COPY  'src/mpmcq_dsects.inc'
          COPY  'src/mpmcq_atomics.mac'
+         COPY  'src/mpmcq_save.mac'
 
 MPMCQFL  CSECT
 MPMCQFL  AMODE 31
@@ -32,15 +38,13 @@ MPMCQFL  RMODE ANY
 
          ENTRY MPMCS_POPNODE
          ENTRY MPMCS_PUSHNODE
+         ENTRY MPMCS_WORKGET
+         ENTRY MPMCS_WORKPUT
 
          USING MPMCQFL,R15
 
 ***********************************************************************
-* MPMCS_POPNODE
-*   Input:  Q_R = SCBaddr
-*   Returns:
-*     R15=0 success, R1=node address
-*     R15=4 empty
+* MPMCS_POPNODE — In: Q_R=SCB  Out: R15=0 R1=node | R15=4 empty
 ***********************************************************************
 MPMCS_POPNODE DS 0H
          STM   R14,R12,12(R13)
@@ -49,52 +53,30 @@ MPMCS_POPNODE DS 0H
          USING MPMCS_SCB,Q_R
 
 POPN_LOOP DS 0H
-* Expected head (ABA,PTR) from SCB.
-* If PTR is zero, freelist is empty.
-         L     R0,SCB_FREE_ABA
-         LT    R1,SCB_FREE_PTR
+         LT    R1,SCB_FREE_PTR             R1 = PTR for CDS odd + node base
          JZ    POPN_EMPTY
+         L     R0,SCB_FREE_ABA             expected ABA (CDS even)
 
-* Snapshot the node pointed to by the freelist head.
-* NOTE: The pointer may change under us; CDS below validates the expected pair.
-         LR    NODE_R,R1                 node = old_ptr
-         USING MPMCQ_NODE,NODE_R
+         USING MPMCQ_NODE,R1               node is already in R1
+         L     R7,NODE_NEXT_PTR            desired PTR
 
-* Desired head becomes (node->next_aba, node->next_ptr).
-* (We keep ABA from node->next; the head ABA itself is refreshed below.)
-         L     R6,NODE_NEXT_ABA
-         L     R7,NODE_NEXT_PTR
+         LA    R6,1(R0)                    desired ABA = old+1
+         CDS   R0,R6,SCB_FREE_ABA(Q_R)     compare (R0,R1) store (R6,R7)
+         JE    POPN_OK
+         MPMCQ_STATINC Q_R,SCB_STAT_FREELIST_POP_RETRY
+         J     POPN_LOOP
 
-* Refresh ABA tag for freelist head update: ABA = SCB_ABA_SEQ++
-POP_ABA_LOOP DS 0H
-         L     R8,SCB_ABA_SEQ
-         LA    R9,1(R8)
-         CS    R8,R9,SCB_ABA_SEQ
-         JNE   POP_ABA_LOOP
-         LR    R6,R9                     desired ABA tag
-         * desired PTR already in R7
-
-* CAS SCB_FREE from expected (R0,R1) to desired (ABA,PTR).
-* On failure, someone else won; retry with the new observed head.
-         CDS   R0,R6,SCB_FREE_ABA(Q_R)
-         JNE   POPN_LOOP
-
-* Success: return node in R1
-         LR    R1,NODE_R
+POPN_OK  DS 0H
+* R1 = popped node, but LM would restore entry R1 — stash it in the SA.
          XR    R15,R15
-         LM    R14,R12,12(R13)
-         BR    R14
+         MPMCQ_LEAF_RETURN_R1 R15,R1
 
 POPN_EMPTY DS 0H
          LA    R15,4
-         LM    R14,R12,12(R13)
-         BR    R14
+         MPMCQ_LEAF_RETURN R15
 
 ***********************************************************************
-* MPMCS_PUSHNODE
-*   Input:  Q_R = SCBaddr
-*           NEWNODE_R = node address
-*   Returns R15=0
+* MPMCS_PUSHNODE — In: Q_R=SCB, NEWNODE_R=node  Out: R15=0
 ***********************************************************************
 MPMCS_PUSHNODE DS 0H
          STM   R14,R12,12(R13)
@@ -104,32 +86,75 @@ MPMCS_PUSHNODE DS 0H
          USING MPMCQ_NODE,NEWNODE_R
 
 PUSHN_LOOP DS 0H
-* Expected head (ABA,PTR) from SCB.
          L     R0,SCB_FREE_ABA
          L     R1,SCB_FREE_PTR
-
-* Link the pushed node to the current head.
-* We store the head ABA/PTR into NODE_NEXT_(ABA,PTR).
          ST    R0,NODE_NEXT_ABA
          ST    R1,NODE_NEXT_PTR
 
-* Desired new head = (newABA, node_ptr).
-PUSH_ABA_LOOP DS 0H
-         L     R8,SCB_ABA_SEQ
-         LA    R9,1(R8)
-         CS    R8,R9,SCB_ABA_SEQ
-         JNE   PUSH_ABA_LOOP
-         LR    R10,R9                    desired ABA
-         LR    R11,NEWNODE_R             desired PTR
+         LA    R10,1(R0)                  desired ABA = old+1
+         LR    R11,NEWNODE_R
 
-* CAS SCB_FREE from expected (R0,R1) to desired (ABA,PTR).
-* On failure, head changed; rewrite node->next_ptr and retry.
          CDS   R0,R10,SCB_FREE_ABA(Q_R)
-         JNE   PUSHN_LOOP
+         JE    PUSHN_OK
+         MPMCQ_STATINC Q_R,SCB_STAT_FREELIST_PUSH_RETRY
+         J     PUSHN_LOOP
+
+PUSHN_OK DS 0H
+         XR    R15,R15
+         MPMCQ_LEAF_RETURN R15
+
+***********************************************************************
+* MPMCS_WORKGET — naked pop from SCB_WORK_* freelist
+*   In:  Q_R = SCB, R14 = return
+*   Out: R15=0, R1=cell  |  R15=4 empty
+*   Clobbers: R0,R1,R6,R7  (R12/R13/Q_R preserved)
+***********************************************************************
+MPMCS_WORKGET DS 0H
+         LR    R11,R15
+         USING MPMCQFL,R11
+         USING MPMCS_SCB,Q_R
+
+WGET_LOOP DS 0H
+         LT    R1,SCB_WORK_PTR             empty check first (skip ABA load)
+         JZ    WGET_EMPTY
+         L     R0,SCB_WORK_ABA
+* Cell link while free: +0 ABA, +4 PTR (same layout as node NEXT)
+         L     R7,4(R1)                    NEXT_PTR
+
+         LA    R6,1(R0)                    desired ABA = old+1
+         CDS   R0,R6,SCB_WORK_ABA(Q_R)
+         JNE   WGET_LOOP
+         XR    R15,R15                     R1 = cell
+         BR    R14
+
+WGET_EMPTY DS 0H
+         LA    R15,4
+         BR    R14
+
+***********************************************************************
+* MPMCS_WORKPUT — naked push onto SCB_WORK_* freelist
+*   In:  Q_R = SCB, R1 = cell, R14 = return
+*   Out: R15=0
+*   Clobbers: R0,R1,R6,R8,R9  (preserves cell contents via R1, Q_R, R12-R14)
+***********************************************************************
+MPMCS_WORKPUT DS 0H
+         LR    R10,R15
+         USING MPMCQFL,R10
+         USING MPMCS_SCB,Q_R
+
+WPUT_LOOP DS 0H
+         L     R0,SCB_WORK_ABA
+         L     R6,SCB_WORK_PTR
+         ST    R0,0(R1)                    cell NEXT_ABA while free
+         ST    R6,4(R1)                    cell NEXT_PTR
+
+         LA    R8,1(R0)                    desired ABA = old+1
+         LR    R9,R1                       desired PTR = this cell
+
+         CDS   R0,R8,SCB_WORK_ABA(Q_R)
+         JNE   WPUT_LOOP
 
          XR    R15,R15
-         LM    R14,R12,12(R13)
          BR    R14
 
          END   MPMCQFL
-

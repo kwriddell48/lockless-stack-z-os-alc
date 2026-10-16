@@ -16,9 +16,28 @@ MPMCS_STATS_VERSION    EQU   1
 
 ***********************************************************************
 * SINIT option bits (SINIT_OPTIONS fullword)
+*
+*  Layout (big-endian fullword) — chosen so fields do not overlap:
+*    bits 0-15  (high half): node prefill count (0 => MPMCS_NODE_PREFILL)
+*    bit  31    (X'00000001'): MPMCS_OPT_PAYLOAD64
+*
+*  Why this layout:
+*    - Hot path does NOT read OPTIONS; it tests SCB_FLAGS with TM (already
+*      one instruction). Rearranging OPTIONS will not speed up SPUSH/SPOP.
+*    - Count in the high half: extract with LLH (no SRL).
+*    - Flag in the low bit: TM ...+3,X'01' or TMLL on a register copy.
+*    - Stop uses X'80000000' in SCB_FLAGS (high bit), so payload stays
+*      at the opposite end of the word and never shares a TM byte with stop.
+*
+* Prefill avoids GETMAIN on the SPUSH warm path (nodes come from freelist).
 ***********************************************************************
 MPMCS_OPT_PAYLOAD31    EQU   X'00000000'  * default: payload allocated below 2G (GETMAIN BELOW)
 MPMCS_OPT_PAYLOAD64    EQU   X'00000001'  * payload allocated in 64-bit storage (IARV64)
+
+* Performance defaults (override node count via OPTIONS high half)
+MPMCS_NODE_PREFILL     EQU   64           * nodes GETMAINed onto freelist at SINIT
+MPMCS_WORK_PREFILL     EQU   16           * work cells onto SCB work pool at SINIT
+MPMCS_WORK_CELL        EQU   512          * fixed work-cell size (SA+spills+IARV MF)
 
 ***********************************************************************
 * Stack Control Block (SCB)
@@ -41,6 +60,10 @@ SCB_TOP_PTR            DS    F                 ptr to top node (31-bit)
 SCB_FREE_ABA           DS    F                 ABA tag
 SCB_FREE_PTR           DS    F                 ptr to free node
 
+* Work-cell freelist (fixed-size SA/spill blocks) — avoids GETMAIN on SPUSH/SPOP
+SCB_WORK_ABA           DS    F                 ABA tag
+SCB_WORK_PTR           DS    F                 ptr to free work cell
+
 * Async callback fields
 SCB_CB_EP              DS    F                 callback entry point (AMODE 31)
 SCB_CB_CTX             DS    F                 user context pointer (31-bit)
@@ -48,17 +71,29 @@ SCB_USER_ECB           DS    F                 optional user ECB to POST per PUS
 
 * Internal notifier support
 SCB_CB_ECB             DS    F                 internal ECB (fullword)
+SCB_STOP_ECB           DS    F                 posted by MPMCS_NOTIF's NOTIF_DONE
+*                                               once the subtask has fully
+*                                               finished cleanup; SCBSTOP WAITs
+*                                               on this before returning so the
+*                                               caller cannot free/reuse the SCB
+*                                               while the subtask is still
+*                                               referencing it.
 SCB_PUSH_SEQ           DS    F                 push sequence (monotonic)
 SCB_CB_SEQ_SEEN        DS    F                 last processed by notifier
 SCB_CB_TCB             DS    F                 notifier TCB addr (optional)
-SCB_ABA_SEQ            DS    F                 global ABA tag generator (monotonic)
+SCB_ABA_SEQ            DS    F                 unused (retained for layout/compat —
+*                                               see mpmcq.asm/mpmcq_freelist.asm
+*                                               header comments: ABA tags are
+*                                               now minted per-field as old+1)
 
 ***********************************************************************
 * Stats (kept in SCB; returned via SSTATS)
 ***********************************************************************
 SCB_STAT_ALIGN         DS    0D
 
-SCB_STAT_PUSH_OK       DS    F
+SCB_STAT_PUSH_OK       DS    F                 unused (retained for layout/compat —
+*                                               see mpmcq_stats.asm: STATS_PUSH_OK
+*                                               is now sourced from SCB_PUSH_SEQ)
 SCB_STAT_POP_OK        DS    F
 SCB_STAT_POP_EMPTY     DS    F
 SCB_STAT_PUSH_ALLOC_FAIL DS  F
@@ -193,4 +228,3 @@ CBP_SCB                 DS   F
 CBP_PENDING             DS   F
 
          END
-

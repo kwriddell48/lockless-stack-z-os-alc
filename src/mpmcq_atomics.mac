@@ -30,12 +30,12 @@
          MEND
 
          MACRO
-&LBL     MPMCQ_STATINC &QCB,&FIELD,&Rold,&Rnew
-* Increment a fullword stat in the QCB (approx but atomic)
-&LBL.    L    &Rold,&FIELD(&QCB)
-         LA   &Rnew,1(&Rold)
-         CS   &Rold,&Rnew,&FIELD(&QCB)
-         JNE  &LBL.
+&LBL     MPMCQ_STATINC &QCB,&FIELD
+* Atomic increment of a fullword stat using LAAL (Load And Add Logical).
+* Uses/clobbers: R1 (working register).
+* Note: LAAL performs an atomic read-modify-write on the memory operand.
+&LBL.    LHI  R1,1
+         LAAL R1,&FIELD(&QCB)
          MEND
 
          MACRO
