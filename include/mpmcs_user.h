@@ -4,12 +4,17 @@
  * entry points using standard OS linkage.
  *
  * Entry points:
- *   SINIT, SPUSH, SPOP, SSTATS, SCBSTOP, GETVERSION
+ *   SINIT, SPUSH, SPOP, SSTATS, SCBSTOP, GETVERSION,
+ *   STRACE, STRACESET
  *
  * Notes:
- *   - The SCB must be in 31-bit addressable storage (below the bar).
+ *   - The SCB must be below the bar and doubleword-aligned (SINIT RC=8).
+ *   - SPUSH src_len must be <= 0x00FFFFFFu (one MVCL). RC=8 if larger
+ *     or if STORAGE / IARV64 fails. SPOP RC=8 means truncated copy;
+ *     the record is still consumed.
+ *   - CDS on tagged heads is lock-free; STORAGE, IARV64, POST, WAIT,
+ *     and ATTACH can block. 32-bit ABA tags wrap.
  *   - Return codes are delivered as the function return value (R15).
- *   - Terminology note: this project avoids certain words; use \"stack\" terms.
  */
 
 #ifndef MPMCS_USER_H
@@ -21,9 +26,19 @@
 /* Options for SINIT */
 #define MPMCS_OPT_PAYLOAD31 0x00000000u
 #define MPMCS_OPT_PAYLOAD64 0x00000001u
+#define MPMCS_OPT_TRACE     0x00000002u
+#define MPMCS_TRC_API       0x01u
+#define MPMCS_TRC_CDS       0x02u
+#define MPMCS_TRC_NTF       0x04u
+#define MPMCS_TRC_ALC       0x08u
+#define MPMCS_TRC_ALL       0x0Fu
+/* OPTIONS high half (bits 0-15): node prefill count (0 = default, typically 64).
+   Example: ((uint32_t)64 << 16) | MPMCS_OPT_PAYLOAD64 */
 
 /* Opaque SCB.
- * Allocate in below-the-bar storage. If you need the exact layout/size,
+ * Allocate in below-the-bar storage and keep it allocated/valid for the full
+ * lifetime of the stack instance (from SINIT until you stop using that SCB
+ * with SPUSH/SPOP/SSTATS/SCBSTOP). If you need the exact layout/size,
  * use the assembler include `user_api.inc` in an assembler module.
  */
 typedef struct MpmcsScb MpmcsScb;
@@ -79,6 +94,8 @@ int32_t SCBSTOP(void* scb);
  *   length at *out_act_len, returning 0 (fit) or 8 (truncated).
  */
 int32_t GETVERSION(char* out_addr, uint32_t out_max_len, uint32_t* out_act_len);
+int32_t STRACE(void* scb, void* out_addr, uint32_t out_len);
+int32_t STRACESET(void* scb, uint32_t mask);
 
 /* -------------------- C-style usage examples -------------------- */
 /*

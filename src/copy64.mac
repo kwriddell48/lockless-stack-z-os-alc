@@ -1,0 +1,49 @@
+         TITLE 'MPMCQ SAM64 copy helpers (31-bit buffers <-> 64-bit...'
+***********************************************************************
+*  COPY64.MAC
+*
+*  Copy helpers used by SPUSH/SPOP to move variable-length data
+*  between 31-bit caller buffers and 64-bit IARV64 payload.
+*
+*  SAM64/SAM31 are problem-state; MVCL does not change AMODE. An
+*  interruptible MVCL resumes in AMODE 64, then SAM31 runs. After
+*  SAM31, LLGFR the MVCL even registers so bits 0-31 of R2-R13 are
+*  not left holding an above-the-bar address (32-bit LM on return
+*  does not restore high halves).
+*
+*  One MVCL moves at most X'FFFFFF' bytes. NILF caps the length
+*  registers. SPUSH rejects srcLen above MPMCS_MAX_COPY (RC=8).
+*  31-bit pointers use LLGTR; 64-bit pointers use LGR.
+***********************************************************************
+
+         MACRO
+&LBL     MPMCQ_COPY_31_TO_64 &SRC31,&DST64,&LEN,&RDST,&RSRC
+         MPMCQ_EVEN2 &RDST,&RSRC,COPY_31_TO_64
+&LBL.    LLGFR &RDST+1,&LEN
+         NILF  &RDST+1,X'00FFFFFF'
+         LLGFR &RSRC+1,&LEN
+         NILF  &RSRC+1,X'00FFFFFF'
+         LGR   &RDST,&DST64
+         LLGTR &RSRC,&SRC31
+         SAM64
+         MVCL  &RDST,&RSRC
+         SAM31
+         LLGFR &RDST,&RDST
+         LLGFR &RSRC,&RSRC
+         MEND
+
+         MACRO
+&LBL     MPMCQ_COPY_64_TO_31 &SRC64,&DST31,&LEN,&RDST,&RSRC
+         MPMCQ_EVEN2 &RDST,&RSRC,COPY_64_TO_31
+&LBL.    LLGFR &RDST+1,&LEN
+         NILF  &RDST+1,X'00FFFFFF'
+         LLGFR &RSRC+1,&LEN
+         NILF  &RSRC+1,X'00FFFFFF'
+         LLGTR &RDST,&DST31
+         LGR   &RSRC,&SRC64
+         SAM64
+         MVCL  &RDST,&RSRC
+         SAM31
+         LLGFR &RDST,&RDST
+         LLGFR &RSRC,&RSRC
+         MEND

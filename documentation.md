@@ -23,37 +23,37 @@ High-level properties:
   - **Public**: `SINIT`, `SPUSH`, `SPOP`
   - Treiber stack operations + notification posts.
 
-- **`src/mpmcq_freelist.asm`**
+- **`src/freelist.asm`**
   - **Internal**: `MPMCS_POPNODE`, `MPMCS_PUSHNODE`
   - Treiber stack used as a node pool (nodes are recycled, not returned to the system).
 
-- **`src/mpmcq_storage.asm`**
+- **`src/storage.asm`**
   - **Internal**: `MPMCS_PAYGET`, `MPMCS_PAYFREE`
   - 64-bit payload allocation/free via `IARV64` using per-call MF=(E,workarea) parameter lists.
 
-- **`src/mpmcq_copy64.mac`**
+- **`src/copy64.mac`**
   - Macros that wrap `SAM64`/`SAM31` around `MVCL` for 31↔64 copies.
 
-- **`src/mpmcq_notify.asm`**
+- **`src/notify.asm`**
   - **Public**: `SCBSTOP`
   - **Internal**: `MPMCS_NSTART`, `MPMCS_NOTIF`
   - Optional notifier TCB that `WAIT`s on an internal ECB and calls a user callback asynchronously.
 
-- **`src/mpmcq_stats.asm`**
+- **`src/stats.asm`**
   - **Public**: `SSTATS`
   - Copies a versioned stats snapshot into a caller buffer.
 
-- **`src/mpmcq_version.asm`**
+- **`src/version.asm`**
   - **Public**: `GETVERSION`
   - Returns an assemble-time-stamped build string using `&SYSDATE` and `&SYSTIME`.
 
-- **`src/mpmcq_dsects.inc`**
+- **`src/dsects.inc`**
   - DSECT layouts: SCB, node, stats, parm lists.
 
-- **`src/mpmcq_atomics.mac`**
+- **`src/atomics.mac`**
   - CS/CDS retry-loop helper macros for atomic counters/max updates.
 
-- **`src/reg_equates.inc`**
+- **`src/regequat.inc`**
   - Register equates `R0..R15` and role aliases used throughout this project.
 
 - **`jcl/asm_lked.jcl`**
@@ -69,7 +69,7 @@ The implementation uses internal register aliases for readability. **Callers do 
 
 ### Data structures
 
-All layouts are in `src/mpmcq_dsects.inc`.
+All layouts are in `src/dsects.inc`.
 
 #### SCB (Stack Control Block)
 
@@ -117,7 +117,7 @@ Nodes live in 31-bit storage; key fields:
 
 All routines use standard z/OS linkage with **R1 -> parameter list**.
 
-Parameter list DSECTs (see `src/mpmcq_dsects.inc`):
+Parameter list DSECTs (see `src/dsects.inc`):
 
 - `MPMCS_SINIT_PLIST`
 - `MPMCS_SPUSH_PLIST`
@@ -176,7 +176,7 @@ Return:
 
 #### `GETVERSION(outAddr, outMaxLen, outActLenAddr)`
 
-Returns an assemble-time stamped string (see `src/mpmcq_version.asm`).
+Returns an assemble-time stamped string (see `src/version.asm`).
 
 - If `outAddr==0`: returns `R1=ptr`, `R0=len`, `R15=0`.
 - Else copies and returns `R15=0` or `R15=8` if truncated.
@@ -349,7 +349,7 @@ All are **approximate under concurrency** by design.
 
 ### Storage model (31-bit nodes + optional 31-bit or 64-bit payload)
 
-- **Nodes**: always `GETMAIN BELOW` and recycled through `src/mpmcq_freelist.asm`.
+- **Nodes**: always `GETMAIN BELOW` and recycled through `src/freelist.asm`.
 
 - **Payload bytes**: configurable per stack instance (default: 31-bit)
 
@@ -364,8 +364,8 @@ All are **approximate under concurrency** by design.
     - accounting: `SCB_STAT_PAYLOAD64_*`
 
   - **Copying**:
-    - 64-bit payload mode uses `SAM64`/`SAM31` wrapped `MVCL` helpers (`src/mpmcq_copy64.mac`).
+    - 64-bit payload mode uses `SAM64`/`SAM31` wrapped `MVCL` helpers (`src/copy64.mac`).
 
-Reentrancy note: `src/mpmcq_storage.asm` uses MF=L templates copied into per-call
+Reentrancy note: `src/storage.asm` uses MF=L templates copied into per-call
 work areas to avoid shared writable IARV64 parameter lists.
 

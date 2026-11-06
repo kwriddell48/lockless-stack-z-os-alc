@@ -1,0 +1,147 @@
+         TITLE 'MPMCQ standard save-area enter/return helpers'
+***********************************************************************
+*  SAVEMAC
+***********************************************************************
+
+SA_LEN   EQU   72
+
+         MACRO
+&LBL     MPMCQ_GETSTG &LEN
+.* Job-step SP, COND=YES: R15=0 R1=addr, or R15!=0 and no abend.
+&LBL     DS    0H
+         STORAGE OBTAIN,LENGTH=(&LEN),LOC=ANY,                         X
+               SP=MPMCS_STORSP,COND=YES
+         MEND
+
+         MACRO
+&LBL     MPMCQ_FRESTG &LEN,&ADDR
+&LBL     DS    0H
+         STORAGE RELEASE,LENGTH=(&LEN),ADDR=(&ADDR),                   X
+               SP=MPMCS_STORSP
+         MEND
+
+         MACRO
+&LBL     MPMCQ_ENTER &WLEN,&BASE
+         AIF   ('&BASE' EQ '').NOB1
+&LBL.    STM   R14,R12,12(R13)
+         LARL  R12,&BASE
+         DROP  R15
+         USING &BASE,R12
+         LA    R3,&WLEN
+         MPMCQ_GETSTG R3
+         LTR   R15,R15
+         JZ    G&SYSNDX
+         LA    R15,8
+         LM    R14,R12,12(R13)
+         BR    R14
+G&SYSNDX DS    0H
+         ST    R13,4(R1)
+         ST    R1,8(R13)
+         LR    R13,R1
+         L     R1,4(R13)
+         L     R1,24(R1)
+         AGO   .OK1
+.NOB1    MNOTE 8,'MPMCQ_ENTER requires CSECT base name'
+.OK1     ANOP
+         MEND
+
+         MACRO
+&LBL     MPMCQ_RETURN &RC,&WLEN
+&LBL.    LR    R3,R13
+         L     R13,4(R13)
+         LR    R15,&RC
+         ST    R15,16(R13)
+         LA    R4,&WLEN
+         MPMCQ_FRESTG R4,R3
+         LM    R14,R12,12(R13)
+         BR    R14
+         MEND
+
+         MACRO
+&LBL     MPMCQ_RETURN_R01 &RC,&WLEN
+&LBL.    LR    R3,R13
+         L     R13,4(R13)
+         LR    R15,&RC
+         ST    R0,20(R13)
+         ST    R1,24(R13)
+         ST    R15,16(R13)
+         LA    R4,&WLEN
+         MPMCQ_FRESTG R4,R3
+         LM    R14,R12,12(R13)
+         BR    R14
+         MEND
+
+         MACRO
+&LBL     MPMCQ_ENTER_SCB &BASE
+         AIF   ('&BASE' EQ '').NOB2
+&LBL.    STM   R14,R12,12(R13)
+         LARL  R12,&BASE
+         DROP  R15
+         USING &BASE,R12
+         L     Q_R,0(R1)                   SCB address
+         LR    R3,R1                       keep plist across WORKGET
+         L     R15,=V(MPMCS_WORKGET)
+         BALR  R14,R15                     naked: R1=cell R15=0|4
+         LTR   R15,R15
+         JZ    H&SYSNDX
+         LA    R4,MPMCS_WORK_CELL
+         MPMCQ_GETSTG R4
+         LTR   R15,R15
+         JZ    C&SYSNDX
+         LA    R15,8
+         LM    R14,R12,12(R13)
+         BR    R14
+H&SYSNDX DS   0H
+C&SYSNDX DS   0H
+         ST    R13,4(R1)
+         ST    R1,8(R13)
+         LR    R13,R1
+         LR    R1,R3                       restore plist
+         AGO   .OK2
+.NOB2    MNOTE 8,'MPMCQ_ENTER_SCB requires CSECT base name'
+.OK2     ANOP
+         MEND
+
+         MACRO
+&LBL     MPMCQ_RETURN_SCB &RC
+&LBL.    LR    R1,R13                      cell
+         L     R13,4(R13)                  caller's SA
+         LR    R3,&RC                      RC in R3 across WORKPUT
+         L     R15,=V(MPMCS_WORKPUT)
+         BALR  R14,R15                     naked: in Q_R,R1=cell
+         LR    R15,R3
+         ST    R15,16(R13)
+* AMODE 31 LM restores bits 32-63 only. LG/LGR/MVCL-64 can leave an
+* above-the-bar high half in R8/R9; zero them before the caller's LM.
+         LLGFR R8,R8
+         LLGFR R9,R9
+         LM    R14,R12,12(R13)
+         BR    R14
+         MEND
+
+         MACRO
+&LBL     MPMCQ_LEAF_RETURN &RC
+&LBL.    LR    R15,&RC
+         ST    R15,16(R13)
+         LM    R14,R12,12(R13)
+         BR    R14
+         MEND
+
+         MACRO
+&LBL     MPMCQ_LEAF_RETURN_R1 &RC,&R1REG
+&LBL.    LR    R1,&R1REG
+         LR    R15,&RC
+         ST    R1,24(R13)
+         ST    R15,16(R13)
+         LM    R14,R12,12(R13)
+         BR    R14
+         MEND
+
+         MACRO
+&LBL     MPMCQ_LEAF_RETURN_R8 &RC
+&LBL.    LR    R15,&RC
+         ST    R8,52(R13)
+         ST    R15,16(R13)
+         LM    R14,R12,12(R13)
+         BR    R14
+         MEND
