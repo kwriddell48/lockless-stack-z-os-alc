@@ -1,0 +1,118 @@
+         TITLE 'MPMCQ atomic helper macros (CS/CDS retry loops)'
+***********************************************************************
+*  ATOMICS.MAC
+*
+*  CS / CDS / LAAL helpers for lock-free updates.
+*  Optimized:
+*    - LM preloads the doubleword (word-concurrent only). Failed
+*      CS/CDS reloads expected register(s) in hardware; retry
+*      branches directly to arithmetic/compare without re-reading mem.
+*    - Uses AHI +1/-1 instead of LA/BCTR to preserve bit 0 in AMODE 31.
+*    - STATINC uses R15, never R0/R1. Those are the CDS compare pair
+*      in every Treiber retry loop. LAAL into R1 after a failed CDS
+*      livelocks: STM/CDS then see PTR = old retry count.
+***********************************************************************
+
+         MACRO
+         MPMCQ_EVEN2 &RA,&RB,&WHO
+         AIF   ((&RA/2)*2 EQ &RA).AOK
+         MNOTE 8,'&WHO first pair reg must be even'
+.AOK     AIF   ((&RB/2)*2 EQ &RB).BOK
+         MNOTE 8,'&WHO second pair reg must be even'
+.BOK     AIF   ('&RA' NE '&RB').DOK
+         MNOTE 8,'&WHO pair regs must be distinct'
+.DOK     ANOP
+         MEND
+
+         MACRO
+&LBL     MPMCQ_CS &Rexp,&Rnew,&ADDR
+&LBL.    CS   &Rexp,&Rnew,&ADDR
+         MEND
+
+         MACRO
+&LBL     MPMCQ_CSLOOP &Rtmp,&Raddr,&DELTA,&DONE
+* Atomic add DELTA (signed fullword) to fullword at (Raddr)
+&LBL.    L    &Rtmp,0(&Raddr)
+A&SYSNDX LR   R0,&Rtmp
+         A    R0,&DELTA
+         CS   &Rtmp,R0,0(&Raddr)
+         JNE  A&SYSNDX
+         J    &DONE
+         MEND
+
+         MACRO
+&LBL     MPMCQ_STATINC &QCB,&FIELD
+* Unsigned 32-bit ++ via LAAL. Wrap permitted.
+* Clobbers: R15 only. Must not touch R0/R1 (CDS compare pair).
+&LBL.    LHI  R15,1
+         LAAL R15,R15,&FIELD
+         MEND
+
+         MACRO
+&LBL     MPMCQ_STATMAX &QCB,&MAXFIELD,&CANDREG,&Rold,&Rnew
+* Signed 32-bit max (DEPTH_MAX). CS reloads &Rold on failure.
+&LBL.    L    &Rold,&MAXFIELD
+A&SYSNDX CR   &CANDREG,&Rold
+         JNH  X&SYSNDX
+         LR   &Rnew,&CANDREG
+         CS   &Rold,&Rnew,&MAXFIELD
+         JNE  A&SYSNDX
+X&SYSNDX DS   0H
+         MEND
+
+         MACRO
+&LBL     MPMCQ_CAS_DW &RCMP,&RNEW,&ADDR
+         MPMCQ_EVEN2 &RCMP,&RNEW,CAS_DW
+&LBL.    CDS  &RCMP,&RNEW,&ADDR
+         MEND
+
+         MACRO
+&LBL     MPMCQ_STATADD64 &QCB,&HIFLD,&LOFLD,&ADDREG,&Rcmp,&Rnew
+* Unsigned 64-bit += unsigned 32-bit &ADDREG. Wrap at 2^64.
+* &HIFLD must be 0D; &LOFLD is the next F.
+         MPMCQ_EVEN2 &Rcmp,&Rnew,STATADD64
+&LBL.    LM   &Rcmp,&Rcmp+1,&HIFLD
+A&SYSNDX LR   &Rnew,&Rcmp
+         LR   &Rnew+1,&Rcmp+1
+         ALR  &Rnew+1,&ADDREG
+         BRC  12,N&SYSNDX                  no carry
+         AHI  &Rnew,1                      full 32-bit +1
+N&SYSNDX CDS  &Rcmp,&Rnew,&HIFLD
+         JNE  A&SYSNDX
+         MEND
+
+         MACRO
+&LBL     MPMCQ_STATADD64S &QCB,&HIFLD,&LOFLD,&ADDREG,&Rcmp,&Rnew
+* Unsigned 64-bit += signed 32-bit &ADDREG (two's complement).
+         MPMCQ_EVEN2 &Rcmp,&Rnew,STATADD64S
+&LBL.    LM   &Rcmp,&Rcmp+1,&HIFLD
+A&SYSNDX LR   &Rnew,&Rcmp
+         LR   &Rnew+1,&Rcmp+1
+         ALR  &Rnew+1,&ADDREG
+         BRC  12,N&SYSNDX                  no carry
+         AHI  &Rnew,1
+N&SYSNDX LTR  &ADDREG,&ADDREG
+         BRC  10,X&SYSNDX                  BNM: ADDREG >= 0
+         AHI  &Rnew,-1
+X&SYSNDX CDS  &Rcmp,&Rnew,&HIFLD
+         JNE  A&SYSNDX
+         MEND
+
+         MACRO
+&LBL     MPMCQ_STATMAX64 &QCB,&MAXHI,&MAXLO,&CANDHI,&CANDLO,&Rcmp,&Rnew
+* Unsigned 64-bit max (payload MAX). Use CLR, not CR.
+* Pass CAND from the STATADD64 new pair (Rnew after CDS), not two
+* separate loads of CUR. LM of MAX can tear; CDS fail retries.
+         MPMCQ_EVEN2 &Rcmp,&Rnew,STATMAX64
+&LBL.    LM   &Rcmp,&Rcmp+1,&MAXHI
+A&SYSNDX CLR  &CANDHI,&Rcmp
+         BH   D&SYSNDX
+         BL   X&SYSNDX
+         CLR  &CANDLO,&Rcmp+1
+         JNH  X&SYSNDX
+D&SYSNDX LR   &Rnew,&CANDHI
+         LR   &Rnew+1,&CANDLO
+         CDS  &Rcmp,&Rnew,&MAXHI
+         JNE  A&SYSNDX
+X&SYSNDX DS   0H
+         MEND

@@ -1,0 +1,63 @@
+         TITLE 'MPMCQ flight-recorder slot claim'
+***********************************************************************
+*  TRACE.MAC
+*
+*  MPMCQ_TRACE CLASS,EVENT[,RA[,RB[,RC]]]
+*    If SCB_TRC_MASK has CLASS, claim the next ring slot with LAAL
+*    into R15 (never R0/R1). Fill CLASS/EVENT/regs first, then
+*    STCKF last so a concurrent STRACE MVCL sees a published TOD
+*    only after the rest of the slot is written.
+*    No-op when MASK is 0 or BASE is 0. Clobbers R15 only.
+*
+*    Do not pass R15 as RA/RB/RC: R15 is the slot pointer after
+*    LAAL/A, so ST R15 would store the ring address, not the value.
+*    STCKF is RXE (base only): use 0(R15), not 0(,R15).
+***********************************************************************
+         MACRO
+&LBL     MPMCQ_TRACE &CLASS,&EVENT,&RA,&RB,&RC
+         AIF   ('&CLASS' NE '').COK
+         MNOTE 8,'MPMCQ_TRACE requires CLASS'
+         MEXIT
+.COK     AIF   ('&RA' NE 'R15').NRA1
+         MNOTE 8,'MPMCQ_TRACE: RA must not be R15'
+         MEXIT
+.NRA1    AIF   ('&RA' NE '15').NRA2
+         MNOTE 8,'MPMCQ_TRACE: RA must not be R15'
+         MEXIT
+.NRA2    AIF   ('&RB' NE 'R15').NRB1
+         MNOTE 8,'MPMCQ_TRACE: RB must not be R15'
+         MEXIT
+.NRB1    AIF   ('&RB' NE '15').NRB2
+         MNOTE 8,'MPMCQ_TRACE: RB must not be R15'
+         MEXIT
+.NRB2    AIF   ('&RC' NE 'R15').NRC1
+         MNOTE 8,'MPMCQ_TRACE: RC must not be R15'
+         MEXIT
+.NRC1    AIF   ('&RC' NE '15').NRC2
+         MNOTE 8,'MPMCQ_TRACE: RC must not be R15'
+         MEXIT
+.NRC2    ANOP
+&LBL     TM    SCB_TRC_MASK+3,&CLASS
+         JZ    X&SYSNDX
+         LT    R15,SCB_TRC_BASE
+         JZ    X&SYSNDX
+         LHI   R15,1
+         LAAL  R15,R15,SCB_TRC_NEXT
+         N     R15,SCB_TRC_NMSK
+         SLL   R15,5
+         A     R15,SCB_TRC_BASE
+         XC    0(32,R15),0(R15)
+         MVI   8(R15),&CLASS
+         MVI   9(R15),&EVENT
+         ST    Q_R,12(,R15)
+         AIF   ('&RA' EQ '').SKA
+         ST    &RA,16(,R15)
+.SKA     AIF   ('&RB' EQ '').SKB
+         ST    &RB,20(,R15)
+.SKB     AIF   ('&RC' EQ '').SKC
+         ST    &RC,24(,R15)
+.SKC     ANOP
+* Publish last: concurrent STRACE treats non-zero TOD as complete.
+         STCKF 0(R15)
+X&SYSNDX DS    0H
+         MEND

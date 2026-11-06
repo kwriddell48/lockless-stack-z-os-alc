@@ -1,6 +1,6 @@
          TITLE 'MPMC stack user include (API + examples)'
 ***********************************************************************
-*  user_api.inc
+*  USERAPI
 *
 *  Single-file user include for calling the MPMC stack entry points.
 *
@@ -15,10 +15,14 @@
 *
 *  Notes:
 *    - Caller runs AMODE 31 and passes a standard parameter list at R1.
-*    - SCB storage must be below-the-bar (31-bit addressable).
-*    - The SCB is caller-owned control-block storage and must remain
-*      allocated/valid for the full lifetime of the stack instance
-*      (from SINIT until you stop using that SCB with SPUSH/SPOP/SSTATS/SCBSTOP).
+*    - SCB storage must be below-the-bar and doubleword-aligned.
+*      SINIT returns RC=8 if the SCB address is not 0D-aligned.
+*    - SPUSH srcLen must be <= X'FFFFFF' (one MVCL). RC=8 if larger
+*      or if STORAGE/IARV64 fails. SPOP RC=8 means truncated copy.
+*    - The SCB is caller-owned and must remain allocated/valid from
+*      SINIT until the last SPUSH/SPOP/SSTATS/SCBSTOP on that SCB.
+*    - CDS on the tagged heads is lock-free. STORAGE, IARV64, POST,
+*      WAIT, and ATTACH can block. 32-bit ABA tags wrap.
 ***********************************************************************
 ***********************************************************************
 * Public entry points (external names)
@@ -29,18 +33,27 @@ SPOP                    EQU   SPOP
 SSTATS                  EQU   SSTATS
 SCBSTOP                 EQU   SCBSTOP
 GETVERSION              EQU   GETVERSION
+STRACE                  EQU   STRACE
+STRACESET               EQU   STRACESET
 ***********************************************************************
 * Options (SINIT OPTIONS)
 *   bit 0      = payload mode (31 vs 64)
-*   bits 0-15 = node prefill count (0 = default MPMCS_NODE_PREFILL)
-*   bit 31    = MPMCS_OPT_PAYLOAD64 (X'00000001')
+*   bits 0-15  = node prefill count (0 = MPMCS_NODE_PREFILL)
+*   bit 31     = MPMCS_OPT_PAYLOAD64 (X'00000001')
 *   Example:  (64)*65536+MPMCS_OPT_PAYLOAD64
 ***********************************************************************
-MPMCS_OPT_PAYLOAD31      EQU   X'00000000'  * default: payload below 2G
-MPMCS_OPT_PAYLOAD64      EQU   X'00000001'  * payload in 64-bit storage (IARV64)
-MPMCS_NODE_PREFILL       EQU   64           * default nodes onto freelist at SINIT
-MPMCS_WORK_PREFILL       EQU   16           * default work cells at SINIT
-MPMCS_WORK_CELL          EQU   512          * fixed work-cell size (ENTER_SCB)
+* default: payload below 2G
+MPMCS_OPT_PAYLOAD31      EQU   X'00000000'
+* payload in 64-bit storage (IARV64)
+MPMCS_OPT_PAYLOAD64      EQU   X'00000001'
+* obtain flight-recorder ring; mask=all classes
+MPMCS_OPT_TRACE          EQU   X'00000002'
+* default nodes onto freelist at SINIT
+MPMCS_NODE_PREFILL       EQU   64
+* default work cells at SINIT
+MPMCS_WORK_PREFILL       EQU   16
+* fixed work-cell size (ENTER_SCB)
+MPMCS_WORK_CELL          EQU   512
 ***********************************************************************
 * Return codes
 ***********************************************************************
@@ -57,30 +70,38 @@ MPMCS_STATS_VERSION    EQU   1
 ***********************************************************************
 MPMCS_SCB              DSECT
 SCB_EYECATCH           DS    CL8               'MPMCSTK '
-SCB_NAME               DS    CL16              user-assigned stack name
+SCB_NAME               DS    CL16              user stack name
 SCB_VERSION            DS    F                 version
 SCB_FLAGS              DS    F                 runtime flags
 * Ensure tagged pointers are doubleword aligned for CDS.
 SCB_ALIGN0             DS    0D
 * Tagged pointer: (ABA32, PTR31)
 SCB_TOP_ABA            DS    F                 ABA tag
-SCB_TOP_PTR            DS    F                 ptr to top node (31-bit)
+SCB_TOP_PTR            DS    F                 ptr to top node
 * Node freelist head (tagged pointer)
 SCB_FREE_ABA           DS    F                 ABA tag
 SCB_FREE_PTR           DS    F                 ptr to free node
-* Work-cell freelist (SPUSH/SPOP save areas — performance pool)
+* Work-cell freelist (SPUSH/SPOP save areas)
 SCB_WORK_ABA           DS    F
 SCB_WORK_PTR           DS    F
 * Async callback fields
-SCB_CB_EP              DS    F                 callback entry point (AMODE 31)
-SCB_CB_CTX             DS    F                 user context pointer (31-bit)
-SCB_USER_ECB           DS    F                 optional user ECB to POST per PUSH
+* callback entry point (AMODE 31)
+SCB_CB_EP              DS    F
+* user context pointer (31-bit)
+SCB_CB_CTX             DS    F
+* optional user ECB to POST per PUSH
+SCB_USER_ECB           DS    F
 * Internal notifier support
-SCB_CB_ECB             DS    F                 internal ECB (fullword)
-SCB_PUSH_SEQ           DS    F                 push sequence (monotonic)
-SCB_CB_SEQ_SEEN        DS    F                 last processed by notifier
-SCB_CB_TCB             DS    F                 notifier TCB addr (optional)
-SCB_ABA_SEQ            DS    F                 global ABA tag generator (monotonic)
+SCB_CB_ECB             DS    F                 internal ECB
+SCB_STOP_ECB           DS    F                 stop ECB
+SCB_PUSH_SEQ           DS    F                 push sequence
+* last processed by notifier
+SCB_CB_SEQ_SEEN        DS    F
+* notifier TCB addr (optional)
+SCB_CB_TCB             DS    F
+* unused (retained for layout)
+SCB_ABA_SEQ            DS    F
+SCB_STAT_PAD           DS    F
 ***********************************************************************
 * Stats (kept in SCB; returned via SSTATS)
 ***********************************************************************
@@ -108,6 +129,13 @@ SCB_STAT_POST_INTERNAL DS   F
 SCB_STAT_POST_USERECB  DS   F
 SCB_STAT_CB_CALLS      DS   F
 SCB_STAT_CB_PENDING_MAX DS  F
+         ORG   MPMCS_SCB+256
+SCB_TRC_MASK           DS    F
+SCB_TRC_BASE           DS    F
+SCB_TRC_N              DS    F
+SCB_TRC_NMSK           DS    F
+SCB_TRC_NEXT           DS    F
+SCB_TRC_LOST           DS    F
 SCB_SIZE               EQU   *-MPMCS_SCB
 ***********************************************************************
 * SSTATS snapshot layout (caller buffer)
@@ -171,13 +199,22 @@ MPMCQ_CB_PLIST          DSECT
 CBP_CTX                 DS   F
 CBP_SCB                 DS   F
 CBP_PENDING             DS   F
+* STRACE(SCBaddr, outAddr, outLen)
+MPMCS_STRACE_PLIST      DSECT
+STR_SCBADDR             DS   F
+STR_OUTADDR             DS   F
+STR_OUTLEN              DS   F
+* STRACESET(SCBaddr, mask)
+MPMCS_STRSET_PLIST      DSECT
+STRS_SCBADDR            DS   F
+STRS_MASK               DS   F
 ***********************************************************************
 * Assembler call examples (outline)
 ***********************************************************************
 * Example: initialize (SINIT)
 *
 *         EXTRN SINIT
-*         COPY  'user_api.inc'
+*         COPY  USERAPI
 *
 *SCB      DS    0D
 *         DS    CL(SCB_SIZE)
@@ -194,8 +231,7 @@ CBP_PENDING             DS   F
 *         MVC   SINIT_USER_ECB(R1),=F'0'
 *         L     R15,=V(SINIT)
 *         BALR  R14,R15
-*         * R15=0 on success
-*
+* R15=0 on success
 ***********************************************************************
 * C-style call examples (illustrative)
 ***********************************************************************
@@ -208,4 +244,3 @@ CBP_PENDING             DS   F
 *   rc = SSTATS(scb, &stats, sizeof(stats));
 *
 ***********************************************************************
-

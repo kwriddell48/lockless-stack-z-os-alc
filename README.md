@@ -43,13 +43,13 @@ Return codes:
 
 ## Source layout
 
-- `src/mpmcq_save.mac`: standard save-area enter/return helpers (RENT).
-- `src/mpmcq_dsects.inc`: DSECTs for SCB, node, stats, parm lists.
-- `src/mpmcq_atomics.mac`: `CS`/`CDS` retry-loop macros.
-- `src/mpmcq_copy64.mac`: `SAM64`/`SAM31` wrapped copy helpers (31<->64).
-- `src/mpmcq_storage.asm`: wrappers for `IARV64` obtain/free (payload) and 31-bit node storage.
-- `src/mpmcq_notify.asm`: notifier TCB body + callback invocation.
-- `src/mpmcq_stats.asm`: `SSTATS` implementation.
+- `src/savemac.mac`: standard save-area enter/return helpers (RENT).
+- `src/dsects.inc`: DSECTs for SCB, node, stats, parm lists.
+- `src/atomics.mac`: `CS`/`CDS` retry-loop macros.
+- `src/copy64.mac`: `SAM64`/`SAM31` wrapped copy helpers (31<->64).
+- `src/storage.asm`: wrappers for `IARV64` obtain/free (payload) and 31-bit node storage.
+- `src/notify.asm`: notifier TCB body + callback invocation.
+- `src/stats.asm`: `SSTATS` implementation.
 - `src/mpmcq.asm`: `SINIT/SPUSH/SPOP` core.
 - `jcl/asm_lked.jcl`: sample assemble/link JCL.
 
@@ -58,7 +58,7 @@ Return codes:
 - This code assumes a z/Architecture environment where `CDS` (doubleword compare-and-swap) is available.
 - Statistics are **approximate** under concurrency to keep the stack lock-free and fast.
 - **Performance pools** (filled at `SINIT`): a node freelist and a fixed-size work-cell freelist so warm-path `SPUSH`/`SPOP` avoid `GETMAIN`/`FREEMAIN`. Override node prefill via `SINIT` OPTIONS **high half** (bits 0–15; 0 = default 64). Payload mode is OPTIONS bit 31 (`MPMCS_OPT_PAYLOAD64`).
-- `src/mpmcq_storage.asm` contains `IARV64` macro usage; you may need to adjust the macro operands to match your z/OS level/policy (key, guard pages, etc.).
+- `src/storage.asm` contains `IARV64` macro usage; you may need to adjust the macro operands to match your z/OS level/policy (key, guard pages, etc.).
 
 ## Using the async notification
 
@@ -74,7 +74,7 @@ Return codes:
 
 ## Statistics
 
-Call `SSTATS(SCBaddr, outStatsAddr, outStatsLen)` to copy a snapshot (see `src/mpmcq_dsects.inc` `MPMCS_STATS` DSECT).
+Call `SSTATS(SCBaddr, outStatsAddr, outStatsLen)` to copy a snapshot (see `src/dsects.inc` `MPMCS_STATS` DSECT).
 
 Included counters:
 
